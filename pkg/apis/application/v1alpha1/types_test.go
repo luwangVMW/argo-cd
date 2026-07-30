@@ -1,9 +1,13 @@
 package v1alpha1
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path"
 	"testing"
@@ -6229,4 +6233,290 @@ func TestGetDrySource_PreservesAllFields(t *testing.T) {
 			}
 		})
 	}
+}
+
+type mockRoundTripper struct {
+	roundTripFunc func(req *http.Request) (*http.Response, error)
+}
+
+func (m *mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return m.roundTripFunc(req)
+}
+
+func TestIsLongRunningRequest(t *testing.T) {
+	tests := []struct {
+		name     string
+		method   string
+		url      string
+		headers  map[string]string
+		expected bool
+	}{
+		{
+			name:     "standard request",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces",
+			expected: false,
+		},
+		{
+			name:     "watch request",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces?watch=true",
+			expected: true,
+		},
+		{
+			name:     "log follow request",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces/default/pods/mypod/log?follow=true",
+			expected: true,
+		},
+		{
+			name:     "log follow request with logs path",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces/default/pods/mypod/logs?follow=true",
+			expected: true,
+		},
+		{
+			name:     "log without follow request",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces/default/pods/mypod/log",
+			expected: false,
+		},
+		{
+			name:     "upgrade connection header",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces/default/pods/mypod/exec",
+			headers:  map[string]string{"Connection": "Upgrade", "Upgrade": "SPDY/3.1"},
+			expected: true,
+		},
+		{
+			name:     "upgrade connection header case insensitive",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces/default/pods/mypod/exec",
+			headers:  map[string]string{"Connection": "keep-alive, Upgrade", "Upgrade": "websocket"},
+			expected: true,
+		},
+		{
+			name:     "exec subresource",
+			method:   "POST",
+			url:      "http://localhost/api/v1/namespaces/default/pods/mypod/exec?container=main",
+			expected: true,
+		},
+		{
+			name:     "attach subresource",
+			method:   "POST",
+			url:      "http://localhost/api/v1/namespaces/default/pods/mypod/attach?container=main",
+			expected: true,
+		},
+		{
+			name:     "portforward subresource",
+			method:   "POST",
+			url:      "http://localhost/api/v1/namespaces/default/pods/mypod/portforward",
+			expected: true,
+		},
+		{
+			name:     "proxy subresource on service",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces/default/services/mysvc/proxy",
+			expected: true,
+		},
+		{
+			name:     "proxy subresource on service with subpath",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces/default/services/mysvc/proxy/some/path",
+			expected: true,
+		},
+		{
+			name:     "pod named exec (not long-running)",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces/default/pods/exec",
+			expected: false,
+		},
+		{
+			name:     "service named proxy (not long-running)",
+			method:   "GET",
+			url:      "http://localhost/api/v1/namespaces/default/services/proxy",
+			expected: false,
+		},
+		{
+			name:     "vcloud k8s proxy based URL standard secrets list (not long-running)",
+			method:   "GET",
+			url:      "http://localhost/proxy/k8s/namespaces/urn:vcloud:namespace:123/api/v1/namespaces/urn:vcloud:namespace:123/secrets",
+			expected: false,
+		},
+		{
+			name:     "vcloud k8s proxy based URL pod exec (long-running)",
+			method:   "POST",
+			url:      "http://localhost/proxy/k8s/namespaces/urn:vcloud:namespace:123/api/v1/namespaces/urn:vcloud:namespace:123/pods/mypod/exec",
+			expected: true,
+		},
+		{
+			name:     "vcloud k8s proxy based URL actual service proxy subresource (long-running)",
+			method:   "GET",
+			url:      "http://localhost/proxy/k8s/namespaces/urn:vcloud:namespace:123/api/v1/namespaces/urn:vcloud:namespace:123/services/mysvc/proxy/some/path",
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(t.Context(), tt.method, tt.url, http.NoBody)
+			require.NoError(t, err)
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			assert.Equal(t, tt.expected, isLongRunningRequest(req))
+		})
+	}
+}
+
+func TestTimeoutRoundTripper_StandardRequest_Timeout(t *testing.T) {
+	mockRT := &mockRoundTripper{
+		roundTripFunc: func(req *http.Request) (*http.Response, error) {
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(50 * time.Millisecond):
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(bytes.NewBufferString("ok")),
+				}, nil
+			}
+		},
+	}
+
+	tr := &timeoutRoundTripper{
+		rt:      mockRT,
+		timeout: 10 * time.Millisecond,
+	}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/api/v1/namespaces", http.NoBody)
+	require.NoError(t, err)
+
+	_, err = tr.RoundTrip(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), context.DeadlineExceeded.Error())
+}
+
+func TestTimeoutRoundTripper_StandardRequest_Success(t *testing.T) {
+	mockRT := &mockRoundTripper{
+		roundTripFunc: func(req *http.Request) (*http.Response, error) {
+			_ = req // avoid unused parameter warning
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString("ok")),
+			}, nil
+		},
+	}
+
+	tr := &timeoutRoundTripper{
+		rt:      mockRT,
+		timeout: 100 * time.Millisecond,
+	}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/api/v1/namespaces", http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", string(body))
+
+	err = resp.Body.Close()
+	require.NoError(t, err)
+}
+
+func TestTimeoutRoundTripper_LongRunningRequest_NoTimeout(t *testing.T) {
+	mockRT := &mockRoundTripper{
+		roundTripFunc: func(req *http.Request) (*http.Response, error) {
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(30 * time.Millisecond):
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(bytes.NewBufferString("watch-ok")),
+				}, nil
+			}
+		},
+	}
+
+	tr := &timeoutRoundTripper{
+		rt:      mockRT,
+		timeout: 10 * time.Millisecond, // shorter than the 30ms delay, but shouldn't trigger
+	}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/api/v1/namespaces?watch=true", http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "watch-ok", string(body))
+
+	err = resp.Body.Close()
+	require.NoError(t, err)
+}
+
+func TestCluster_RawRestConfig_WrapTransport(t *testing.T) {
+	// Save original K8sServerSideTimeout and restore it after test
+	origTimeout := K8sServerSideTimeout
+	K8sServerSideTimeout = 10 * time.Second
+	defer func() {
+		K8sServerSideTimeout = origTimeout
+	}()
+
+	cluster := &Cluster{
+		Server: "https://localhost:6443",
+	}
+
+	config, err := cluster.RawRestConfig()
+	require.NoError(t, err)
+	assert.NotNil(t, config.WrapTransport)
+	assert.Equal(t, time.Duration(0), config.Timeout)
+
+	// Verify that WrapTransport wraps with timeoutRoundTripper
+	mockRT := &mockRoundTripper{
+		roundTripFunc: func(req *http.Request) (*http.Response, error) {
+			_ = req
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString("ok")),
+			}, nil
+		},
+	}
+	wrapped := config.WrapTransport(mockRT)
+	require.NotNil(t, wrapped)
+	_, ok := wrapped.(*timeoutRoundTripper)
+	assert.True(t, ok)
+}
+
+func TestCluster_RESTConfig_NoDoubleWrap(t *testing.T) {
+	// Save original K8sServerSideTimeout and restore it after test
+	origTimeout := K8sServerSideTimeout
+	K8sServerSideTimeout = 10 * time.Second
+	defer func() {
+		K8sServerSideTimeout = origTimeout
+	}()
+
+	cluster := &Cluster{
+		Server: "https://localhost:6443",
+	}
+
+	config, err := cluster.RESTConfig()
+	require.NoError(t, err)
+	assert.NotNil(t, config.Transport)
+
+	// Verify that Transport is a timeoutRoundTripper, and is NOT double-wrapped
+	tr, ok := config.Transport.(*timeoutRoundTripper)
+	require.True(t, ok)
+
+	// The inner roundtripper of the timeoutRoundTripper should NOT be another timeoutRoundTripper
+	_, ok = tr.rt.(*timeoutRoundTripper)
+	assert.False(t, ok)
 }
