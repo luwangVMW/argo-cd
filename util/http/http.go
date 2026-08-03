@@ -241,7 +241,11 @@ func isLongRunningRequest(req *http.Request) bool {
 	}
 
 	hasFollow := false
-	if req.URL.RawQuery != "" {
+	rawQuery := req.URL.RawQuery
+	// A percent sign may be part of an encoded watch or follow parameter name,
+	// for example %77atch=true, so parse any encoded query as a candidate.
+	if rawQuery != "" && (strings.Contains(rawQuery, "watch") ||
+		strings.Contains(rawQuery, "follow") || strings.Contains(rawQuery, "%")) {
 		query := req.URL.Query()
 		if hasTrueValue(query["watch"]) {
 			return true
@@ -258,10 +262,11 @@ func isLongRunningRequest(req *http.Request) bool {
 		return false
 	}
 
-	segments := strings.Split(strings.Trim(path, "/"), "/")
-	for i := 2; i < len(segments); i++ {
-		resource := segments[i-2]
-		subresource := segments[i]
+	var twoSegmentsBack string
+	var previousSegment string
+	for segment := range strings.SplitSeq(strings.Trim(path, "/"), "/") {
+		resource := twoSegmentsBack
+		subresource := segment
 		switch {
 		case resource == "pods" &&
 			(subresource == "exec" || subresource == "attach" || subresource == "portforward"):
@@ -272,6 +277,7 @@ func isLongRunningRequest(req *http.Request) bool {
 			(resource == "pods" || resource == "services" || resource == "nodes"):
 			return true
 		}
+		twoSegmentsBack, previousSegment = previousSegment, segment
 	}
 
 	return false

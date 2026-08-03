@@ -219,6 +219,7 @@ func TestIsLongRunningRequest(t *testing.T) {
 		expected bool
 	}{
 		{name: "standard request", url: "https://kubernetes.example/api/v1/pods"},
+		{name: "list request", url: "https://kubernetes.example/api/v1/pods?limit=500&resourceVersion=123"},
 		{name: "watch request", url: "https://kubernetes.example/api/v1/pods?watch=true", expected: true},
 		{name: "watch alternate boolean", url: "https://kubernetes.example/api/v1/pods?watch=1", expected: true},
 		{name: "watch false", url: "https://kubernetes.example/api/v1/pods?watch=false"},
@@ -239,6 +240,7 @@ func TestIsLongRunningRequest(t *testing.T) {
 		{name: "service named proxy", url: "https://kubernetes.example/api/v1/namespaces/default/services/proxy"},
 		{name: "node proxy", url: "https://kubernetes.example/api/v1/nodes/node/proxy", expected: true},
 		{name: "proxy prefix regular request", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets"},
+		{name: "proxy prefix list request with encoded selector", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets?limit=500&labelSelector=app%3Dargocd"},
 		{name: "proxy prefix pod exec", url: "https://kubernetes.example/proxy/k8s/api/v1/namespaces/default/pods/pod/exec", expected: true},
 	}
 
@@ -405,6 +407,9 @@ func BenchmarkIsLongRunningRequest(b *testing.B) {
 		{name: "no query", url: "https://kubernetes.example/api/v1/pods"},
 		{name: "list query", url: "https://kubernetes.example/api/v1/pods?limit=500&resourceVersion=123"},
 		{name: "watch query", url: "https://kubernetes.example/api/v1/pods?watch=true&resourceVersion=123"},
+		{name: "proxy prefix no query", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets"},
+		{name: "proxy prefix list query", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets?limit=500&resourceVersion=123"},
+		{name: "proxy prefix pod exec", url: "https://kubernetes.example/proxy/k8s/api/v1/namespaces/default/pods/pod/exec"},
 	}
 
 	for _, tt := range tests {
