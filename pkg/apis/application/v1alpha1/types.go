@@ -2,12 +2,10 @@ package v1alpha1
 
 import (
 	"bytes"
-	"context"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"math"
 	"net"
@@ -43,6 +41,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/client-go/transport"
 	"sigs.k8s.io/yaml"
 
 	"github.com/argoproj/argo-cd/v3/util/rbac"
@@ -3898,131 +3897,6 @@ func setFinalizer(meta *metav1.ObjectMeta, name string, exist bool) {
 	}
 }
 
-type cancelReadCloser struct {
-	io.ReadCloser
-	cancel context.CancelFunc
-}
-
-func (c *cancelReadCloser) Close() error {
-	err := c.ReadCloser.Close()
-	c.cancel()
-	return err
-}
-
-type timeoutRoundTripper struct {
-	rt      http.RoundTripper
-	timeout time.Duration
-}
-
-func (t *timeoutRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	rt := t.rt
-	if rt == nil {
-		rt = http.DefaultTransport
-	}
-
-	if isLongRunningRequest(req) {
-		return rt.RoundTrip(req)
-	}
-
-	ctx, cancel := context.WithTimeout(req.Context(), t.timeout)
-	reqWithTimeout := req.WithContext(ctx)
-
-	resp, err := rt.RoundTrip(reqWithTimeout)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
-	if resp.Body != nil {
-		resp.Body = &cancelReadCloser{
-			ReadCloser: resp.Body,
-			cancel:     cancel,
-		}
-	} else {
-		cancel()
-	}
-	return resp, nil
-}
-
-func isLongRunningRequest(req *http.Request) bool {
-	if req == nil || req.URL == nil {
-		return false
-	}
-
-	// 1. Fast path: Check Upgrade headers
-	if req.Header.Get("Upgrade") != "" {
-		return true
-	}
-	if conn := req.Header.Get("Connection"); conn != "" {
-		if strings.Contains(strings.ToLower(conn), "upgrade") {
-			return true
-		}
-	}
-
-	// 2. Fast path: Check raw query string for "watch" or "follow"
-	// Avoids parsing query map for 99% of non-stream requests
-	hasFollow := false
-	if rawQuery := req.URL.RawQuery; rawQuery != "" {
-		if strings.Contains(rawQuery, "watch") && isTrue(req.URL.Query().Get("watch")) {
-			return true
-		}
-		if strings.Contains(rawQuery, "follow") && isTrue(req.URL.Query().Get("follow")) {
-			hasFollow = true
-		}
-	}
-
-	// 3. Fast path & Zero-Allocation Check:
-	path := req.URL.Path
-
-	// Check exec, attach, portforward (only long-running if the parent resource is "/pods/")
-	if idx := strings.LastIndex(path, "/exec"); idx > 0 {
-		if strings.Contains(path[:idx], "/pods/") {
-			return true
-		}
-	}
-	if idx := strings.LastIndex(path, "/attach"); idx > 0 {
-		if strings.Contains(path[:idx], "/pods/") {
-			return true
-		}
-	}
-	if idx := strings.LastIndex(path, "/portforward"); idx > 0 {
-		if strings.Contains(path[:idx], "/pods/") {
-			return true
-		}
-	}
-
-	// Check log, logs (only long-running if hasFollow is true and the parent resource is "/pods/")
-	if hasFollow {
-		if idx := strings.LastIndex(path, "/log"); idx > 0 {
-			if strings.Contains(path[:idx], "/pods/") {
-				return true
-			}
-		}
-		if idx := strings.LastIndex(path, "/logs"); idx > 0 {
-			if strings.Contains(path[:idx], "/pods/") {
-				return true
-			}
-		}
-	}
-
-	// Check proxy (long-running if the parent resource is "/pods/", "/services/", or "/nodes/")
-	if idx := strings.LastIndex(path, "/proxy"); idx > 0 {
-		prefix := path[:idx]
-		if strings.Contains(prefix, "/pods/") ||
-			strings.Contains(prefix, "/services/") ||
-			strings.Contains(prefix, "/nodes/") {
-			return true
-		}
-	}
-
-	return false
-}
-
-func isTrue(val string) bool {
-	b, _ := strconv.ParseBool(val)
-	return b
-}
-
 // SetK8SConfigDefaults sets Kubernetes REST config default settings
 func SetK8SConfigDefaults(config *rest.Config) error {
 	config.QPS = K8sClientConfigQPS
@@ -4060,25 +3934,38 @@ func SetK8SConfigDefaults(config *rest.Config) error {
 	config.AuthProvider = nil
 	config.ExecProvider = nil
 
-	// Set server-side timeout
-	if K8sServerSideTimeout > 0 {
-		if _, ok := tr.(*timeoutRoundTripper); !ok {
-			tr = &timeoutRoundTripper{
-				rt:      tr,
-				timeout: K8sServerSideTimeout,
-			}
-		}
-	}
+	// Apply the Kubernetes API request timeout at the transport layer so it can
+	// exclude long-running requests and give each retry attempt its own timeout.
 	config.Timeout = 0
-
 	config.Transport = tr
+	// HTTPWrappersForConfig already applied the existing wrapper to tr. Clear it
+	// before adding Argo CD wrappers so client-go does not apply it a second time.
+	config.WrapTransport = nil
+	if K8sServerSideTimeout > 0 {
+		appendTransportWrapper(config, utilhttp.WithTimeoutForNonLongRunningRequests(K8sServerSideTimeout))
+	}
 	maxRetries := env.ParseInt64FromEnv(utilhttp.EnvRetryMax, 0, 1, math.MaxInt64)
 	if maxRetries > 0 {
 		backoffDurationMS := env.ParseInt64FromEnv(utilhttp.EnvRetryBaseBackoff, 100, 1, math.MaxInt64)
 		backoffDuration := time.Duration(backoffDurationMS) * time.Millisecond
-		config.WrapTransport = utilhttp.WithRetry(maxRetries, backoffDuration)
+		// Retry is intentionally the outer wrapper. A stuck attempt times out,
+		// while the original request context remains available for the next retry.
+		appendTransportWrapper(config, utilhttp.WithRetry(maxRetries, backoffDuration))
 	}
 	return nil
+}
+
+func appendTransportWrapper(config *rest.Config, wrapper transport.WrapperFunc) {
+	if wrapper == nil {
+		return
+	}
+	previous := config.WrapTransport
+	config.WrapTransport = func(rt http.RoundTripper) http.RoundTripper {
+		if previous != nil {
+			rt = previous(rt)
+		}
+		return wrapper(rt)
+	}
 }
 
 // ParseProxyUrl returns a parsed url and verifies that schema is correct
@@ -4095,8 +3982,7 @@ func ParseProxyUrl(proxyUrl string) (*url.URL, error) { //nolint:revive //FIXME(
 	return u, nil
 }
 
-// RawRestConfig returns a go-client REST config from cluster that might be serialized into the file using kube.WriteKubeConfig method.
-func (c *Cluster) RawRestConfig() (*rest.Config, error) {
+func (c *Cluster) rawRestConfig() (*rest.Config, error) {
 	var config *rest.Config
 	var err error
 
@@ -4204,27 +4090,27 @@ func (c *Cluster) RawRestConfig() (*rest.Config, error) {
 		config.Proxy = http.ProxyURL(u)
 	}
 	config.DisableCompression = c.Config.DisableCompression
-	if K8sServerSideTimeout > 0 {
-		prev := config.WrapTransport
-		config.WrapTransport = func(rt http.RoundTripper) http.RoundTripper {
-			if prev != nil {
-				rt = prev(rt)
-			}
-			return &timeoutRoundTripper{
-				rt:      rt,
-				timeout: K8sServerSideTimeout,
-			}
-		}
-	}
 	config.Timeout = 0
 	config.QPS = K8sClientConfigQPS
 	config.Burst = K8sClientConfigBurst
 	return config, nil
 }
 
+// RawRestConfig returns a go-client REST config from cluster that might be serialized into the file using kube.WriteKubeConfig method.
+func (c *Cluster) RawRestConfig() (*rest.Config, error) {
+	config, err := c.rawRestConfig()
+	if err != nil {
+		return nil, err
+	}
+	if K8sServerSideTimeout > 0 {
+		appendTransportWrapper(config, utilhttp.WithTimeoutForNonLongRunningRequests(K8sServerSideTimeout))
+	}
+	return config, nil
+}
+
 // RESTConfig returns a go-client REST config from cluster with tuned throttling and HTTP client settings.
 func (c *Cluster) RESTConfig() (*rest.Config, error) {
-	config, err := c.RawRestConfig()
+	config, err := c.rawRestConfig()
 	if err != nil {
 		return nil, fmt.Errorf("unable to get K8s RAW REST config: %w", err)
 	}
