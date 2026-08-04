@@ -186,27 +186,30 @@ func WithRetry(maxRetries int64, baseRetryBackoff time.Duration) transport.Wrapp
 
 // WithTimeoutForNonLongRunningRequests applies a per-attempt timeout to
 // Kubernetes API requests without limiting long-running connections.
-func WithTimeoutForNonLongRunningRequests(timeout time.Duration) transport.WrapperFunc {
+func WithTimeoutForNonLongRunningRequests(timeout time.Duration, serverPathPrefix string) transport.WrapperFunc {
+	serverPathPrefix = strings.TrimRight(serverPathPrefix, "/")
 	return func(rt http.RoundTripper) http.RoundTripper {
 		if rt == nil {
 			rt = http.DefaultTransport
 		}
 		return &nonLongRunningTimeoutTransport{
-			inner:   rt,
-			timeout: timeout,
+			inner:            rt,
+			timeout:          timeout,
+			serverPathPrefix: serverPathPrefix,
 		}
 	}
 }
 
 type nonLongRunningTimeoutTransport struct {
-	inner   http.RoundTripper
-	timeout time.Duration
+	inner            http.RoundTripper
+	timeout          time.Duration
+	serverPathPrefix string
 }
 
 var _ utilnet.RoundTripperWrapper = (*nonLongRunningTimeoutTransport)(nil)
 
 func (t *nonLongRunningTimeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.timeout <= 0 || isLongRunningRequest(req) {
+	if t.timeout <= 0 || isLongRunningRequest(req, t.serverPathPrefix) {
 		return t.inner.RoundTrip(req)
 	}
 
@@ -231,7 +234,7 @@ func (t *nonLongRunningTimeoutTransport) WrappedRoundTripper() http.RoundTripper
 	return t.inner
 }
 
-func isLongRunningRequest(req *http.Request) bool {
+func isLongRunningRequest(req *http.Request, serverPathPrefix string) bool {
 	if req == nil || req.URL == nil {
 		return false
 	}
@@ -253,7 +256,7 @@ func isLongRunningRequest(req *http.Request) bool {
 		hasFollow = hasTrueValue(query["follow"])
 	}
 
-	path := req.URL.Path
+	path := stripServerPathPrefix(req.URL.Path, serverPathPrefix)
 	if !strings.Contains(path, "/exec") &&
 		!strings.Contains(path, "/attach") &&
 		!strings.Contains(path, "/portforward") &&
@@ -281,6 +284,19 @@ func isLongRunningRequest(req *http.Request) bool {
 	}
 
 	return false
+}
+
+func stripServerPathPrefix(requestPath, serverPathPrefix string) string {
+	if serverPathPrefix == "" || !strings.HasPrefix(requestPath, serverPathPrefix) {
+		return requestPath
+	}
+	if len(requestPath) == len(serverPathPrefix) {
+		return "/"
+	}
+	if requestPath[len(serverPathPrefix)] != '/' {
+		return requestPath
+	}
+	return requestPath[len(serverPathPrefix):]
 }
 
 func headerHasToken(header http.Header, name, expected string) bool {

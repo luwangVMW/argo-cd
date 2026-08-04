@@ -3901,6 +3901,10 @@ func setFinalizer(meta *metav1.ObjectMeta, name string, exist bool) {
 func SetK8SConfigDefaults(config *rest.Config) error {
 	config.QPS = K8sClientConfigQPS
 	config.Burst = K8sClientConfigBurst
+	timeoutWrapper, err := k8sRequestTimeoutWrapper(config)
+	if err != nil {
+		return err
+	}
 	tlsConfig, err := rest.TLSConfigFor(config)
 	if err != nil {
 		return err
@@ -3941,9 +3945,7 @@ func SetK8SConfigDefaults(config *rest.Config) error {
 	// HTTPWrappersForConfig already applied the existing wrapper to tr. Clear it
 	// before adding Argo CD wrappers so client-go does not apply it a second time.
 	config.WrapTransport = nil
-	if K8sServerSideTimeout > 0 {
-		appendTransportWrapper(config, utilhttp.WithTimeoutForNonLongRunningRequests(K8sServerSideTimeout))
-	}
+	appendTransportWrapper(config, timeoutWrapper)
 	maxRetries := env.ParseInt64FromEnv(utilhttp.EnvRetryMax, 0, 1, math.MaxInt64)
 	if maxRetries > 0 {
 		backoffDurationMS := env.ParseInt64FromEnv(utilhttp.EnvRetryBaseBackoff, 100, 1, math.MaxInt64)
@@ -3953,6 +3955,17 @@ func SetK8SConfigDefaults(config *rest.Config) error {
 		appendTransportWrapper(config, utilhttp.WithRetry(maxRetries, backoffDuration))
 	}
 	return nil
+}
+
+func k8sRequestTimeoutWrapper(config *rest.Config) (transport.WrapperFunc, error) {
+	if K8sServerSideTimeout <= 0 {
+		return nil, nil
+	}
+	serverURL, _, err := rest.DefaultServerUrlFor(config)
+	if err != nil {
+		return nil, fmt.Errorf("unable to determine Kubernetes API server path prefix: %w", err)
+	}
+	return utilhttp.WithTimeoutForNonLongRunningRequests(K8sServerSideTimeout, serverURL.Path), nil
 }
 
 func appendTransportWrapper(config *rest.Config, wrapper transport.WrapperFunc) {
@@ -4102,9 +4115,11 @@ func (c *Cluster) RawRestConfig() (*rest.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if K8sServerSideTimeout > 0 {
-		appendTransportWrapper(config, utilhttp.WithTimeoutForNonLongRunningRequests(K8sServerSideTimeout))
+	timeoutWrapper, err := k8sRequestTimeoutWrapper(config)
+	if err != nil {
+		return nil, err
 	}
+	appendTransportWrapper(config, timeoutWrapper)
 	return config, nil
 }
 

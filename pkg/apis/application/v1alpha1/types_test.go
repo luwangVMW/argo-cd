@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -6281,6 +6282,31 @@ func TestSetK8SConfigDefaultsDoesNotApplyExistingTransportWrapperTwice(t *testin
 
 	config.WrapTransport(config.Transport)
 	assert.Equal(t, 1, wrapCount)
+}
+
+func TestSetK8SConfigDefaultsExcludesServerPathPrefixFromTimeoutClassification(t *testing.T) {
+	originalTimeout := K8sServerSideTimeout
+	K8sServerSideTimeout = time.Minute
+	t.Cleanup(func() {
+		K8sServerSideTimeout = originalTimeout
+	})
+
+	config := &rest.Config{Host: "https://kubernetes.example/services/gateway/proxy/urn:cluster/"}
+	require.NoError(t, SetK8SConfigDefaults(config))
+	require.NotNil(t, config.WrapTransport)
+
+	var requestContext context.Context
+	wrapped := config.WrapTransport(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		requestContext = req.Context()
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+	}))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, config.Host+"api/v1/pods", http.NoBody)
+	require.NoError(t, err)
+	resp, err := wrapped.RoundTrip(req)
+	require.NoError(t, err)
+	_, hasDeadline := requestContext.Deadline()
+	assert.True(t, hasDeadline)
+	require.NoError(t, resp.Body.Close())
 }
 
 func TestSetK8SConfigDefaultsRetriesAfterPerAttemptTimeout(t *testing.T) {

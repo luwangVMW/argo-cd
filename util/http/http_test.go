@@ -213,10 +213,11 @@ func TestIsLongRunningRequest(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name     string
-		url      string
-		headers  http.Header
-		expected bool
+		name             string
+		url              string
+		serverPathPrefix string
+		headers          http.Header
+		expected         bool
 	}{
 		{name: "standard request", url: "https://kubernetes.example/api/v1/pods"},
 		{name: "list request", url: "https://kubernetes.example/api/v1/pods?limit=500&resourceVersion=123"},
@@ -239,9 +240,11 @@ func TestIsLongRunningRequest(t *testing.T) {
 		{name: "proxying is not proxy", url: "https://kubernetes.example/api/v1/namespaces/default/services/service/proxying"},
 		{name: "service named proxy", url: "https://kubernetes.example/api/v1/namespaces/default/services/proxy"},
 		{name: "node proxy", url: "https://kubernetes.example/api/v1/nodes/node/proxy", expected: true},
-		{name: "proxy prefix regular request", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets"},
-		{name: "proxy prefix list request with encoded selector", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets?limit=500&labelSelector=app%3Dargocd"},
-		{name: "proxy prefix pod exec", url: "https://kubernetes.example/proxy/k8s/api/v1/namespaces/default/pods/pod/exec", expected: true},
+		{name: "proxy prefix regular request", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets", serverPathPrefix: "/proxy/k8s"},
+		{name: "proxy prefix list request with encoded selector", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets?limit=500&labelSelector=app%3Dargocd", serverPathPrefix: "/proxy/k8s"},
+		{name: "proxy prefix pod exec", url: "https://kubernetes.example/proxy/k8s/api/v1/namespaces/default/pods/pod/exec", serverPathPrefix: "/proxy/k8s", expected: true},
+		{name: "server prefix resembling service proxy", url: "https://kubernetes.example/services/gateway/proxy/urn:cluster/api/v1/secrets", serverPathPrefix: "/services/gateway/proxy/urn:cluster"},
+		{name: "service proxy after server prefix", url: "https://kubernetes.example/services/gateway/proxy/urn:cluster/api/v1/namespaces/default/services/service/proxy/path", serverPathPrefix: "/services/gateway/proxy/urn:cluster", expected: true},
 	}
 
 	for _, tt := range tests {
@@ -250,26 +253,53 @@ func TestIsLongRunningRequest(t *testing.T) {
 			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, tt.url, http.NoBody)
 			require.NoError(t, err)
 			req.Header = tt.headers
-			assert.Equal(t, tt.expected, isLongRunningRequest(req))
+			assert.Equal(t, tt.expected, isLongRunningRequest(req, tt.serverPathPrefix))
 		})
 	}
 
-	assert.False(t, isLongRunningRequest(nil))
-	assert.False(t, isLongRunningRequest(&http.Request{}))
+	assert.False(t, isLongRunningRequest(nil, ""))
+	assert.False(t, isLongRunningRequest(&http.Request{}, ""))
+}
+
+func TestStripServerPathPrefix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		requestPath      string
+		serverPathPrefix string
+		expected         string
+	}{
+		{name: "empty prefix", requestPath: "/api/v1/pods", expected: "/api/v1/pods"},
+		{name: "matching prefix", requestPath: "/proxy/urn:cluster/api/v1/pods", serverPathPrefix: "/proxy/urn:cluster", expected: "/api/v1/pods"},
+		{name: "exact prefix", requestPath: "/proxy/urn:cluster", serverPathPrefix: "/proxy/urn:cluster", expected: "/"},
+		{name: "prefix must end at segment boundary", requestPath: "/proxy/urn:cluster-other/api/v1/pods", serverPathPrefix: "/proxy/urn:cluster", expected: "/proxy/urn:cluster-other/api/v1/pods"},
+		{name: "different prefix", requestPath: "/other/api/v1/pods", serverPathPrefix: "/proxy/urn:cluster", expected: "/other/api/v1/pods"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, stripServerPathPrefix(tt.requestPath, tt.serverPathPrefix))
+		})
+	}
 }
 
 func TestTimeoutForNonLongRunningRequestsSetsExpectedDeadline(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name            string
-		url             string
-		expectsDeadline bool
+		name             string
+		url              string
+		serverPathPrefix string
+		expectsDeadline  bool
 	}{
 		{name: "regular request", url: "https://kubernetes.example/api/v1/pods", expectsDeadline: true},
+		{name: "regular request behind server path prefix", url: "https://kubernetes.example/services/gateway/proxy/urn:cluster/api/v1/pods", serverPathPrefix: "/services/gateway/proxy/urn:cluster/", expectsDeadline: true},
 		{name: "watch request", url: "https://kubernetes.example/api/v1/pods?watch=true"},
 		{name: "followed pod log", url: "https://kubernetes.example/api/v1/namespaces/default/pods/pod/log?follow=true"},
 		{name: "pod exec", url: "https://kubernetes.example/api/v1/namespaces/default/pods/pod/exec"},
+		{name: "service proxy behind server path prefix", url: "https://kubernetes.example/services/gateway/proxy/urn:cluster/api/v1/namespaces/default/services/service/proxy/path", serverPathPrefix: "/services/gateway/proxy/urn:cluster"},
 	}
 
 	for _, tt := range tests {
@@ -283,7 +313,7 @@ func TestTimeoutForNonLongRunningRequestsSetsExpectedDeadline(t *testing.T) {
 					Body:       io.NopCloser(strings.NewReader("ok")),
 				}, nil
 			})
-			wrapped := WithTimeoutForNonLongRunningRequests(time.Minute)(inner)
+			wrapped := WithTimeoutForNonLongRunningRequests(time.Minute, tt.serverPathPrefix)(inner)
 			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, tt.url, http.NoBody)
 			require.NoError(t, err)
 
@@ -303,7 +333,7 @@ func TestTimeoutForNonLongRunningRequestsTimesOutRoundTrip(t *testing.T) {
 		<-req.Context().Done()
 		return nil, req.Context().Err()
 	})
-	wrapped := WithTimeoutForNonLongRunningRequests(10 * time.Millisecond)(inner)
+	wrapped := WithTimeoutForNonLongRunningRequests(10*time.Millisecond, "")(inner)
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://kubernetes.example/api/v1/pods", http.NoBody)
 	require.NoError(t, err)
 
@@ -334,7 +364,7 @@ func TestTimeoutForNonLongRunningRequestsTimesOutResponseBodyRead(t *testing.T) 
 			Body:       &contextBlockingBody{ctx: req.Context()},
 		}, nil
 	})
-	wrapped := WithTimeoutForNonLongRunningRequests(10 * time.Millisecond)(inner)
+	wrapped := WithTimeoutForNonLongRunningRequests(10*time.Millisecond, "")(inner)
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://kubernetes.example/api/v1/pods", http.NoBody)
 	require.NoError(t, err)
 
@@ -363,7 +393,7 @@ func TestTimeoutForNonLongRunningRequestsCancelsContextAfterBodyCompletion(t *te
 					Body:       io.NopCloser(strings.NewReader("ok")),
 				}, nil
 			})
-			wrapped := WithTimeoutForNonLongRunningRequests(time.Minute)(inner)
+			wrapped := WithTimeoutForNonLongRunningRequests(time.Minute, "")(inner)
 			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://kubernetes.example/api/v1/pods", http.NoBody)
 			require.NoError(t, err)
 
@@ -384,7 +414,7 @@ func TestTimeoutForNonLongRunningRequestsIsTransparentWrapper(t *testing.T) {
 	t.Parallel()
 
 	inner := &TestRoundTripper{}
-	wrapped := WithTimeoutForNonLongRunningRequests(time.Minute)(inner)
+	wrapped := WithTimeoutForNonLongRunningRequests(time.Minute, "")(inner)
 	wrapper, ok := wrapped.(utilnet.RoundTripperWrapper)
 	require.True(t, ok)
 	assert.Same(t, inner, wrapper.WrappedRoundTripper())
@@ -393,7 +423,7 @@ func TestTimeoutForNonLongRunningRequestsIsTransparentWrapper(t *testing.T) {
 func TestTimeoutForNonLongRunningRequestsUsesDefaultTransportWhenInnerIsNil(t *testing.T) {
 	t.Parallel()
 
-	wrapped := WithTimeoutForNonLongRunningRequests(time.Minute)(nil)
+	wrapped := WithTimeoutForNonLongRunningRequests(time.Minute, "")(nil)
 	wrapper, ok := wrapped.(utilnet.RoundTripperWrapper)
 	require.True(t, ok)
 	assert.Same(t, http.DefaultTransport, wrapper.WrappedRoundTripper())
@@ -401,15 +431,16 @@ func TestTimeoutForNonLongRunningRequestsUsesDefaultTransportWhenInnerIsNil(t *t
 
 func BenchmarkIsLongRunningRequest(b *testing.B) {
 	tests := []struct {
-		name string
-		url  string
+		name             string
+		url              string
+		serverPathPrefix string
 	}{
 		{name: "no query", url: "https://kubernetes.example/api/v1/pods"},
 		{name: "list query", url: "https://kubernetes.example/api/v1/pods?limit=500&resourceVersion=123"},
 		{name: "watch query", url: "https://kubernetes.example/api/v1/pods?watch=true&resourceVersion=123"},
-		{name: "proxy prefix no query", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets"},
-		{name: "proxy prefix list query", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets?limit=500&resourceVersion=123"},
-		{name: "proxy prefix pod exec", url: "https://kubernetes.example/proxy/k8s/api/v1/namespaces/default/pods/pod/exec"},
+		{name: "proxy prefix no query", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets", serverPathPrefix: "/proxy/k8s"},
+		{name: "proxy prefix list query", url: "https://kubernetes.example/proxy/k8s/api/v1/secrets?limit=500&resourceVersion=123", serverPathPrefix: "/proxy/k8s"},
+		{name: "proxy prefix pod exec", url: "https://kubernetes.example/proxy/k8s/api/v1/namespaces/default/pods/pod/exec", serverPathPrefix: "/proxy/k8s"},
 	}
 
 	for _, tt := range tests {
@@ -418,7 +449,7 @@ func BenchmarkIsLongRunningRequest(b *testing.B) {
 			require.NoError(b, err)
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				isLongRunningRequest(req)
+				isLongRunningRequest(req, tt.serverPathPrefix)
 			}
 		})
 	}
