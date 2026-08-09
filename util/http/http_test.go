@@ -2,11 +2,13 @@ package http
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
@@ -293,4 +295,150 @@ func TestWithServerSideTimeoutDisabledReturnsInnerTransport(t *testing.T) {
 
 	inner := &TestRoundTripper{}
 	assert.Same(t, inner, WithServerSideTimeout(0)(inner))
+}
+
+type capturedSlowRequestLog struct {
+	fields  log.Fields
+	level   log.Level
+	message string
+}
+
+func captureSlowRequestLogs(logs chan<- capturedSlowRequestLog) slowRequestLogger {
+	return func(fields log.Fields, level log.Level, message string) {
+		logs <- capturedSlowRequestLog{fields: fields, level: level, message: message}
+	}
+}
+
+func receiveSlowRequestLog(t *testing.T, logs <-chan capturedSlowRequestLog) capturedSlowRequestLog {
+	t.Helper()
+	select {
+	case entry := <-logs:
+		return entry
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for slow request log")
+		return capturedSlowRequestLog{}
+	}
+}
+
+func TestSlowRequestLoggingReportsWaitingForHeadersWithoutCancellingRequest(t *testing.T) {
+	logs := make(chan capturedSlowRequestLog, 2)
+	releaseResponse := make(chan struct{})
+	inner := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		<-releaseResponse
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+	})
+	wrapper := newSlowRequestLoggingTransport(inner, 10*time.Millisecond, captureSlowRequestLogs(logs))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://proxy.example/api/v1/namespaces/default/pods?watch=true&continue=secret", http.NoBody)
+	require.NoError(t, err)
+
+	requestDone := make(chan error, 1)
+	go func() {
+		resp, err := wrapper.RoundTrip(req)
+		if err == nil {
+			err = resp.Body.Close()
+		}
+		requestDone <- err
+	}()
+
+	warning := receiveSlowRequestLog(t, logs)
+	assert.Equal(t, log.WarnLevel, warning.level)
+	assert.Equal(t, "Kubernetes API request is still waiting for response headers", warning.message)
+	assert.Equal(t, "waiting_for_response_headers", warning.fields["phase"])
+	assert.Equal(t, "GET /api/v1/namespaces/default/pods", warning.fields["command"])
+	assert.Equal(t, "/api/v1/namespaces/default/pods", warning.fields["path"])
+	assert.NotContains(t, fmt.Sprint(warning.fields), "continue")
+	assert.NotContains(t, fmt.Sprint(warning.fields), "secret")
+
+	close(releaseResponse)
+	completion := receiveSlowRequestLog(t, logs)
+	assert.Equal(t, log.InfoLevel, completion.level)
+	assert.Equal(t, "Slow Kubernetes API request completed", completion.message)
+	assert.Equal(t, "request_completed", completion.fields["phase"])
+	assert.Equal(t, "response_headers_received", completion.fields["result"])
+	assert.Equal(t, warning.fields["request_id"], completion.fields["request_id"])
+	require.NoError(t, <-requestDone)
+}
+
+func TestSlowRequestLoggingReportsStalledResponseBodyUntilEOF(t *testing.T) {
+	logs := make(chan capturedSlowRequestLog, 2)
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+	inner := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Body:          reader,
+			ContentLength: -1,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})
+	wrapper := newSlowRequestLoggingTransport(inner, 10*time.Millisecond, captureSlowRequestLogs(logs))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://proxy.example/apis/apps/v1/deployments", http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := wrapper.RoundTrip(req)
+	require.NoError(t, err)
+	bodyRead := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(resp.Body)
+		bodyRead <- err
+	}()
+
+	warning := receiveSlowRequestLog(t, logs)
+	assert.Equal(t, log.WarnLevel, warning.level)
+	assert.Equal(t, "Kubernetes API response body has stopped making progress", warning.message)
+	assert.Equal(t, "reading_response_body", warning.fields["phase"])
+	assert.Equal(t, int64(0), warning.fields["bytes_received"])
+	assert.Equal(t, http.StatusOK, warning.fields["status_code"])
+
+	_, err = writer.Write([]byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	require.NoError(t, <-bodyRead)
+
+	completion := receiveSlowRequestLog(t, logs)
+	assert.Equal(t, log.InfoLevel, completion.level)
+	assert.Equal(t, "response_body_complete", completion.fields["result"])
+	assert.Equal(t, int64(len("payload")), completion.fields["bytes_received"])
+	assert.Equal(t, warning.fields["request_id"], completion.fields["request_id"])
+	require.NoError(t, resp.Body.Close())
+}
+
+func TestSlowRequestLoggingDoesNotWrapStreamingResponseBody(t *testing.T) {
+	logs := make(chan capturedSlowRequestLog, 1)
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+	inner := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Body:          reader,
+			ContentLength: -1,
+			Header:        http.Header{"Content-Type": []string{"application/json;stream=watch"}},
+		}, nil
+	})
+	wrapper := newSlowRequestLoggingTransport(inner, 10*time.Millisecond, captureSlowRequestLogs(logs))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://proxy.example/api/v1/pods?watch=true", http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := wrapper.RoundTrip(req)
+	require.NoError(t, err)
+	assert.Same(t, reader, resp.Body)
+	assert.Empty(t, logs)
+}
+
+func TestWithSlowRequestLoggingWrapperConfiguration(t *testing.T) {
+	t.Parallel()
+
+	inner := &TestRoundTripper{}
+	assert.Same(t, inner, WithSlowRequestLogging(0)(inner))
+
+	wrapper := WithSlowRequestLogging(time.Second)(inner)
+	transparentWrapper, ok := wrapper.(utilnet.RoundTripperWrapper)
+	require.True(t, ok)
+	assert.Same(t, inner, transparentWrapper.WrappedRoundTripper())
 }

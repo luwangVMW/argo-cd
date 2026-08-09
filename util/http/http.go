@@ -9,11 +9,14 @@ import (
 	"net/http/httputil"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/client-go/transport"
+	"k8s.io/streaming/pkg/httpstream"
 
 	"github.com/argoproj/argo-cd/v3/common"
 	"github.com/argoproj/argo-cd/v3/util/env"
@@ -27,6 +30,9 @@ const (
 	retryWaitMax        = time.Duration(10) * time.Second
 	EnvRetryMax         = "ARGOCD_K8SCLIENT_RETRY_MAX"
 	EnvRetryBaseBackoff = "ARGOCD_K8SCLIENT_RETRY_BASE_BACKOFF"
+
+	EnvSlowRequestLogThreshold     = "ARGOCD_K8SCLIENT_SLOW_REQUEST_LOG_THRESHOLD"
+	DefaultSlowRequestLogThreshold = 30 * time.Second
 )
 
 // max number of chunks a cookie can be broken into. To be compatible with
@@ -220,6 +226,258 @@ func (t *serverSideTimeoutTransport) RoundTrip(req *http.Request) (*http.Respons
 
 func (t *serverSideTimeoutTransport) WrappedRoundTripper() http.RoundTripper {
 	return t.inner
+}
+
+// WithSlowRequestLogging logs Kubernetes API requests that spend longer than
+// threshold waiting for response headers or stop making progress while reading
+// a finite response body. It observes requests without cancelling them.
+func WithSlowRequestLogging(threshold time.Duration) transport.WrapperFunc {
+	return func(rt http.RoundTripper) http.RoundTripper {
+		if threshold <= 0 {
+			return rt
+		}
+		if rt == nil {
+			rt = http.DefaultTransport
+		}
+		return newSlowRequestLoggingTransport(rt, threshold, logSlowRequest)
+	}
+}
+
+type slowRequestLogger func(log.Fields, log.Level, string)
+
+func logSlowRequest(fields log.Fields, level log.Level, message string) {
+	log.WithFields(fields).Log(level, message)
+}
+
+type slowRequestLoggingTransport struct {
+	inner     http.RoundTripper
+	threshold time.Duration
+	logger    slowRequestLogger
+}
+
+var (
+	_                    utilnet.RoundTripperWrapper = (*slowRequestLoggingTransport)(nil)
+	slowRequestIDCounter atomic.Uint64
+)
+
+func newSlowRequestLoggingTransport(rt http.RoundTripper, threshold time.Duration, logger slowRequestLogger) http.RoundTripper {
+	return &slowRequestLoggingTransport{
+		inner:     rt,
+		threshold: threshold,
+		logger:    logger,
+	}
+}
+
+func (t *slowRequestLoggingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	state := newSlowRequestLogState(req, t.logger)
+	headerTimer := time.AfterFunc(t.threshold, state.logWaitingForHeaders)
+
+	resp, err := t.inner.RoundTrip(req)
+	state.markRoundTripDone(resp)
+	headerTimer.Stop()
+
+	if err != nil {
+		state.logCompletion("request_failed", 0, false, err)
+		return nil, err
+	}
+
+	if resp.Body == nil || resp.Body == http.NoBody || resp.ContentLength == 0 || isStreamingResponse(req, resp) {
+		state.logCompletion("response_headers_received", 0, false, nil)
+		return resp, nil
+	}
+
+	resp.Body = newSlowResponseBody(resp.Body, t.threshold, state)
+	return resp, nil
+}
+
+func (t *slowRequestLoggingTransport) WrappedRoundTripper() http.RoundTripper {
+	return t.inner
+}
+
+type slowRequestLogState struct {
+	mu sync.Mutex
+
+	logger slowRequestLogger
+
+	requestID uint64
+	method    string
+	host      string
+	path      string
+	startedAt time.Time
+
+	roundTripDone bool
+	headersWarned bool
+	timeToHeaders time.Duration
+	statusCode    int
+}
+
+func newSlowRequestLogState(req *http.Request, logger slowRequestLogger) *slowRequestLogState {
+	return &slowRequestLogState{
+		logger:    logger,
+		requestID: slowRequestIDCounter.Add(1),
+		method:    req.Method,
+		host:      req.URL.Host,
+		path:      req.URL.EscapedPath(),
+		startedAt: time.Now(),
+	}
+}
+
+func (s *slowRequestLogState) logWaitingForHeaders() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.roundTripDone {
+		return
+	}
+
+	s.headersWarned = true
+	fields := s.fieldsLocked("waiting_for_response_headers")
+	s.logger(fields, log.WarnLevel, "Kubernetes API request is still waiting for response headers")
+}
+
+func (s *slowRequestLogState) markRoundTripDone(resp *http.Response) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.roundTripDone = true
+	if resp != nil {
+		s.timeToHeaders = time.Since(s.startedAt)
+		s.statusCode = resp.StatusCode
+	}
+}
+
+func (s *slowRequestLogState) fieldsLocked(phase string) log.Fields {
+	fields := log.Fields{
+		"request_id": s.requestID,
+		"method":     s.method,
+		"host":       s.host,
+		"path":       s.path,
+		"command":    fmt.Sprintf("%s %s", s.method, s.path),
+		"phase":      phase,
+		"elapsed_ms": time.Since(s.startedAt).Milliseconds(),
+	}
+	if s.statusCode != 0 {
+		fields["status_code"] = s.statusCode
+	}
+	if s.timeToHeaders != 0 {
+		fields["time_to_headers_ms"] = s.timeToHeaders.Milliseconds()
+	}
+	return fields
+}
+
+func (s *slowRequestLogState) logBodyStalled(idleFor time.Duration, bytesReceived int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fields := s.fieldsLocked("reading_response_body")
+	fields["body_idle_ms"] = idleFor.Milliseconds()
+	fields["bytes_received"] = bytesReceived
+	s.logger(fields, log.WarnLevel, "Kubernetes API response body has stopped making progress")
+}
+
+func (s *slowRequestLogState) logCompletion(result string, bytesReceived int64, bodyWarned bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.headersWarned && !bodyWarned {
+		return
+	}
+
+	fields := s.fieldsLocked("request_completed")
+	fields["result"] = result
+	fields["bytes_received"] = bytesReceived
+	if err != nil {
+		fields["error"] = err
+	}
+	s.logger(fields, log.InfoLevel, "Slow Kubernetes API request completed")
+}
+
+type slowResponseBody struct {
+	inner     io.ReadCloser
+	threshold time.Duration
+	state     *slowRequestLogState
+
+	mu            sync.Mutex
+	timer         *time.Timer
+	lastProgress  time.Time
+	bytesReceived int64
+	warned        bool
+	done          bool
+}
+
+func newSlowResponseBody(inner io.ReadCloser, threshold time.Duration, state *slowRequestLogState) io.ReadCloser {
+	body := &slowResponseBody{
+		inner:        inner,
+		threshold:    threshold,
+		state:        state,
+		lastProgress: time.Now(),
+	}
+	body.timer = time.AfterFunc(threshold, body.logStalled)
+	return body
+}
+
+func (b *slowResponseBody) Read(p []byte) (int, error) {
+	n, err := b.inner.Read(p)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.done {
+		return n, err
+	}
+
+	if n > 0 {
+		b.bytesReceived += int64(n)
+		b.lastProgress = time.Now()
+		if !b.warned {
+			b.timer.Stop()
+			b.timer.Reset(b.threshold)
+		}
+	}
+
+	if err != nil {
+		result := "response_body_failed"
+		completionErr := err
+		if err == io.EOF {
+			result = "response_body_complete"
+			completionErr = nil
+		}
+		b.finishLocked(result, completionErr)
+	}
+	return n, err
+}
+
+func (b *slowResponseBody) Close() error {
+	err := b.inner.Close()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.done {
+		b.finishLocked("response_body_closed", err)
+	}
+	return err
+}
+
+func (b *slowResponseBody) logStalled() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.done || b.warned {
+		return
+	}
+
+	b.warned = true
+	b.state.logBodyStalled(time.Since(b.lastProgress), b.bytesReceived)
+}
+
+func (b *slowResponseBody) finishLocked(result string, err error) {
+	b.done = true
+	b.timer.Stop()
+	b.state.logCompletion(result, b.bytesReceived, b.warned, err)
+}
+
+func isStreamingResponse(req *http.Request, resp *http.Response) bool {
+	query := req.URL.Query()
+	watch, _ := strconv.ParseBool(query.Get("watch"))
+	follow, _ := strconv.ParseBool(query.Get("follow"))
+	return watch ||
+		(follow && strings.HasSuffix(req.URL.Path, "/log")) ||
+		httpstream.IsUpgradeRequest(req) ||
+		resp.StatusCode == http.StatusSwitchingProtocols ||
+		strings.Contains(resp.Header.Get("Content-Type"), "stream=watch")
 }
 
 type retryTransport struct {

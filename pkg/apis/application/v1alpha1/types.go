@@ -3946,6 +3946,12 @@ func SetK8SConfigDefaults(config *rest.Config) error {
 	if K8sServerSideTimeout > 0 {
 		appendTransportWrapper(config, utilhttp.WithServerSideTimeout(K8sServerSideTimeout))
 	}
+	slowRequestLogThreshold := env.ParseDurationFromEnv(utilhttp.EnvSlowRequestLogThreshold, utilhttp.DefaultSlowRequestLogThreshold, 0, math.MaxInt32*time.Second)
+	if slowRequestLogThreshold > 0 {
+		// Slow request logging is inside the retry wrapper so every API request
+		// attempt is diagnosed independently.
+		appendTransportWrapper(config, utilhttp.WithSlowRequestLogging(slowRequestLogThreshold))
+	}
 	maxRetries := env.ParseInt64FromEnv(utilhttp.EnvRetryMax, 0, 1, math.MaxInt64)
 	if maxRetries > 0 {
 		backoffDurationMS := env.ParseInt64FromEnv(utilhttp.EnvRetryBaseBackoff, 100, 1, math.MaxInt64)
@@ -4106,6 +4112,10 @@ func (c *Cluster) RawRestConfig() (*rest.Config, error) {
 	}
 	if K8sServerSideTimeout > 0 {
 		appendTransportWrapper(config, utilhttp.WithServerSideTimeout(K8sServerSideTimeout))
+	}
+	slowRequestLogThreshold := env.ParseDurationFromEnv(utilhttp.EnvSlowRequestLogThreshold, utilhttp.DefaultSlowRequestLogThreshold, 0, math.MaxInt32*time.Second)
+	if slowRequestLogThreshold > 0 {
+		appendTransportWrapper(config, utilhttp.WithSlowRequestLogging(slowRequestLogThreshold))
 	}
 	return config, nil
 }

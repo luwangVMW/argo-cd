@@ -634,6 +634,17 @@ The retry logic can be fine-tuned with the following environment variables:
 * `ARGOCD_K8SCLIENT_RETRY_BASE_BACKOFF` - The initial backoff delay on the first retry attempt in ms. Subsequent retries
   will double this backoff time up to a maximum threshold. Defaults to 100ms.
 
+### Diagnosing Slow Kubernetes API Requests
+
+Argo CD logs a warning when a Kubernetes API request waits longer than 30 seconds for response headers or when a
+non-streaming response body stops making progress for that duration. Set `ARGOCD_K8SCLIENT_SLOW_REQUEST_LOG_THRESHOLD`
+to a Go duration such as `10s` or `2m` to change the threshold. Set it to `0` to disable slow-request logging.
+
+> [!NOTE]
+> Slow-request logging is diagnostic only and does not cancel the request. Watch, streaming log, exec, attach, and
+> port-forward connections are monitored while waiting for their initial response headers, but their streaming bodies
+> are not treated as stalled responses.
+
 ### Backoff Strategy
 
 The backoff strategy employed is a simple exponential backoff without jitter. The backoff time increases exponentially
